@@ -1,0 +1,58 @@
+From 11723102c0473dd3bf015b945952df00e38bd76c Mon Sep 17 00:00:00 2001
+From: A4100N LCN port <you@example.org>
+Date: Thu, 11 Jun 2026 10:07:52 +0000
+Subject: [PATCH 1/3] b43: lcn: wait for R-cal completion in radio 2064 init
+
+b43_radio_2064_init() transliterates wlc_radio_2064_init() ->
+wlc_lcnphy_rcal() from brcmsmac, but the R-cal step was left with the
+completion poll as a TODO and only issued a dummy read of radio register
+0x05c. Without waiting for the calibration-done bit the init sequence
+proceeds before the resistor calibration has settled.
+
+In brcmsmac, wlc_lcnphy_rcal() does mdelay(5) then
+SPINWAIT(!wlc_radio_2064_rcal_done(pi)), where
+wlc_radio_2064_rcal_done(pi) == (read_radio_reg(pi, 0x05c) & 0x20).
+Mirror that here with a bounded poll (b43 has no SPINWAIT).
+
+NOT validated on hardware; transliteration against brcmsmac phy_lcn.c.
+Part of the LCN-PHY (BCM4313) bring-up for the A4100N.
+
+Signed-off-by: A4100N LCN port <you@example.org>
+---
+ drivers/net/wireless/broadcom/b43/phy_lcn.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/phy_lcn.c b/drivers/net/wireless/broadcom/b43/phy_lcn.c
+index dd72689..3ef30be 100644
+--- a/drivers/net/wireless/broadcom/b43/phy_lcn.c
++++ b/drivers/net/wireless/broadcom/b43/phy_lcn.c
+@@ -108,6 +108,8 @@ static void b43_radio_2064_channel_setup(struct b43_wldev *dev)
+ /* wlc_radio_2064_init */
+ static void b43_radio_2064_init(struct b43_wldev *dev)
+ {
++	int i;
++
+ 	if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ) {
+ 		b43_radio_write(dev, 0x09c, 0x0020);
+ 		b43_radio_write(dev, 0x105, 0x0008);
+@@ -141,8 +143,15 @@ static void b43_radio_2064_init(struct b43_wldev *dev)
+ 	b43_radio_set(dev, 0x057, 0x1);
+ 	b43_radio_set(dev, 0x05b, 0x2);
+ 
+-	/* TODO: wait for some bit to be set */
+-	b43_radio_read(dev, 0x05c);
++	mdelay(5);
++	/* R-cal done: RADIO 0x05c bit5 (wlc_radio_2064_rcal_done) */
++	for (i = 0; i < 10000; i++) {		/* up to ~100 ms */
++		if (b43_radio_read(dev, 0x05c) & 0x20)
++			break;
++		udelay(10);
++	}
++	if (!(b43_radio_read(dev, 0x05c) & 0x20))
++		b43dbg(dev->wl, "LCN: R-cal did not complete\n");
+ 
+ 	b43_radio_mask(dev, 0x05b, (u16) ~0xff02);
+ 	b43_radio_mask(dev, 0x057, (u16) ~0xff01);
+-- 
+2.43.0
+

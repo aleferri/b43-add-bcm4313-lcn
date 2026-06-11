@@ -1,0 +1,89 @@
+From 9a70329538bc800b41f1de3f759c8ccfb9607db0 Mon Sep 17 00:00:00 2001
+From: A4100N LCN port <you@example.org>
+Date: Thu, 11 Jun 2026 10:08:21 +0000
+Subject: [PATCH 2/3] b43: lcn: pin TX power to fixed open-loop gain for legacy
+ bring-up
+
+b43_phy_lcn_tx_pwr_ctl_init() programmed a fixed TX gain only on the
+!hw_pwr_ctl_capable path and then ran b43_phy_lcn_sense_setup(), which
+relies on the still-unfinished tx-power-by-index path (TODOs there),
+does a dummy transmission and touches ucode-assisted calibration. For
+Phase 1 we only need the PHY to come up and pass legacy (b/g) traffic.
+
+Force the open-loop fixed-gain path unconditionally and drop the sensing
+call. This mirrors brcmsmac's !hw_pwr_ctl behaviour minus calibration.
+Real (closed-loop) TX power control and temperature/vbat sensing are
+deferred to Phase 2; b43_phy_lcn_sense_setup() is kept but marked
+__maybe_unused until then.
+
+NOT validated on hardware. Part of the LCN-PHY (BCM4313) bring-up for
+the A4100N.
+
+Signed-off-by: A4100N LCN port <you@example.org>
+---
+ drivers/net/wireless/broadcom/b43/phy_lcn.c | 40 +++++++++++----------
+ 1 file changed, 21 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/phy_lcn.c b/drivers/net/wireless/broadcom/b43/phy_lcn.c
+index 3ef30be..cca39dd 100644
+--- a/drivers/net/wireless/broadcom/b43/phy_lcn.c
++++ b/drivers/net/wireless/broadcom/b43/phy_lcn.c
+@@ -316,7 +316,7 @@ static void b43_phy_lcn_bu_tweaks(struct b43_wldev *dev)
+ }
+ 
+ /* wlc_lcnphy_vbat_temp_sense_setup */
+-static void b43_phy_lcn_sense_setup(struct b43_wldev *dev,
++static void __maybe_unused b43_phy_lcn_sense_setup(struct b43_wldev *dev,
+ 				    enum lcn_sense_type sense_type)
+ {
+ 	u8 auxpga_vmidcourse, auxpga_vmidfine, auxpga_gain;
+@@ -543,26 +543,28 @@ static void b43_phy_lcn_tx_pwr_ctl_init(struct b43_wldev *dev)
+ 
+ 	b43_mac_suspend(dev);
+ 
+-	if (!dev->phy.lcn->hw_pwr_ctl_capable) {
+-		if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ) {
+-			tx_gains.gm_gain = 4;
+-			tx_gains.pga_gain = 12;
+-			tx_gains.pad_gain = 12;
+-			tx_gains.dac_gain = 0;
+-			bbmult = 150;
+-		} else {
+-			tx_gains.gm_gain = 7;
+-			tx_gains.pga_gain = 15;
+-			tx_gains.pad_gain = 14;
+-			tx_gains.dac_gain = 0;
+-			bbmult = 150;
+-		}
+-		b43_phy_lcn_set_tx_gain(dev, &tx_gains);
+-		b43_phy_lcn_set_bbmult(dev, bbmult);
+-		b43_phy_lcn_sense_setup(dev, B43_SENSE_TEMP);
++	/*
++	 * Phase 1 bring-up: run open-loop at a fixed TX gain. Hardware power
++	 * control and temperature/vbat sensing depend on the unfinished
++	 * tx-power-by-index path (see the TODOs in b43_phy_lcn_sense_setup)
++	 * and on ucode-assisted calibration, so they are deferred. This is
++	 * brcmsmac's !hw_pwr_ctl path with the sensing step removed.
++	 */
++	if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ) {
++		tx_gains.gm_gain = 4;
++		tx_gains.pga_gain = 12;
++		tx_gains.pad_gain = 12;
++		tx_gains.dac_gain = 0;
++		bbmult = 150;
+ 	} else {
+-		b43err(dev->wl, "TX power control not supported for this HW\n");
++		tx_gains.gm_gain = 7;
++		tx_gains.pga_gain = 15;
++		tx_gains.pad_gain = 14;
++		tx_gains.dac_gain = 0;
++		bbmult = 150;
+ 	}
++	b43_phy_lcn_set_tx_gain(dev, &tx_gains);
++	b43_phy_lcn_set_bbmult(dev, bbmult);
+ 
+ 	b43_mac_enable(dev);
+ }
+-- 
+2.43.0
+

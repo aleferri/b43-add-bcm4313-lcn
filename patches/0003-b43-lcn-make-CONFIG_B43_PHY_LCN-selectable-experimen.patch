@@ -1,0 +1,53 @@
+From 42f427587223d7cef4d136eecfaf4b130e383cf8 Mon Sep 17 00:00:00 2001
+From: A4100N LCN port <you@example.org>
+Date: Thu, 11 Jun 2026 10:33:55 +0000
+Subject: [PATCH 3/3] b43: lcn: make CONFIG_B43_PHY_LCN selectable
+ (experimental)
+
+The LCN-PHY support was gated behind "depends on B43 && BROKEN", which
+compiles out the whole LCN path: PHY recognition in b43_phy_versioning(),
+b43_phyops_lcn allocation, and the ucode24_lcn/ucode25_lcn selection in
+b43_request_firmware(). As a result b43 never even attempts to claim a
+BCM4313 / load its ucode.
+
+Drop the BROKEN dependency so the option can be enabled for development.
+With it set, b43 recognises the LCN PHY (phy_rev <= 1, e.g. BCM4313),
+allocates the LCN ops and requests b43/ucode24_lcn.fw (extract it with
+b43-fwcutter from the proprietary driver).
+
+This only makes the path reachable; bring-up is still incomplete (PHY
+calibration not yet ported) so it is labelled EXPERIMENTAL, not fixed.
+Part of the LCN-PHY (BCM4313) bring-up for the A4100N.
+
+Signed-off-by: A4100N LCN port <you@example.org>
+---
+ drivers/net/wireless/broadcom/b43/Kconfig | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/Kconfig b/drivers/net/wireless/broadcom/b43/Kconfig
+index 4559549..f9a8203 100644
+--- a/drivers/net/wireless/broadcom/b43/Kconfig
++++ b/drivers/net/wireless/broadcom/b43/Kconfig
+@@ -141,12 +141,15 @@ config B43_PHY_HT
+ 	  This PHY type with 3x3:3 MIMO can be found in the BCM4331 PCI chipset.
+ 
+ config B43_PHY_LCN
+-	bool "Support for LCN-PHY devices (BROKEN)"
+-	depends on B43 && BROKEN
++	bool "Support for LCN-PHY devices (EXPERIMENTAL)"
++	depends on B43
+ 	help
+-	  Support for the LCN-PHY.
++	  Support for the LCN-PHY. Work in progress: BCM4313 (e.g. A4100N)
++	  bring-up under b43 with the proprietary ucode (via b43-fwcutter).
+ 
+-	  Say N, this is BROKEN and crashes driver.
++	  Incomplete: PHY calibration is not yet ported, so this may fail to
++	  reach association and can misbehave. Say N unless you are
++	  developing or testing this support.
+ 
+ config B43_PHY_AC
+ 	bool "Support for AC-PHY (802.11ac) devices (BROKEN)"
+-- 
+2.43.0
+
