@@ -200,33 +200,48 @@ def check_0003(blob):
     return "SKIP", "patch di solo Kconfig: nessuna costante da confrontare col blob"
 
 
-def check_0004_preflight(blob):
-    """PREFLIGHT 0004 (non ancora scritta): RC-cal, gate della ricezione.
+def check_rc_cal_inline(blob):
+    """rc_cal: gia` inline in b43, nessuna patch separata serve.
 
-    brcmsmac wlc_lcnphy_rc_cal scrive un default costante (dflt_rc_cal_val=7,
-    o 11 se LCNREV 1) nei PHY reg 0x933..0x937. Qui verifichiamo solo che il
-    blob programmi gli stessi registri (landmark), per orientare la futura 0004.
+    brcmsmac scrive il default costante di rc_cal (7, o 11 se LCNREV 1) nei PHY
+    reg 0x933..0x937; in b43 quegli stessi valori sono gia` emessi da
+    b43_radio_2064_init (verificato: 0x2d6b/0x016b == default LCNREV 1).
+    Confermiamo soltanto che il blob tocchi lo stesso landmark.
     """
     func = "wlc_phy_init_lcnphy"
     if func not in blob.funcs:
         return "FAIL", f"{func} assente nel blob"
     regs = {0x933, 0x934, 0x935, 0x936, 0x937}
     have = regs & a1_immediates(blob, func)
-    if regs <= have and references(blob, func, "write_phy_reg"):
-        return ("PREFLIG",
-                f"{func} programma i RC-filter reg 0x933..0x937 via write_phy_reg "
-                f"(valori derivati a runtime). brcmsmac rc_cal usa invece il "
-                f"default costante 7/11: punto di partenza valido per 0004")
+    if regs <= have:
+        return ("OK",
+                f"{func} tocca 0x933..0x937: rc_cal e` gia` inline in "
+                f"b43_radio_2064_init (default LCNREV 1), non va portato. "
+                f"La cal di ricezione vera e` la 0004 (RX-IQ).")
     return ("DIVERGE",
-            f"{func}: RC-filter reg trovati {sorted(hex(x) for x in have)} su "
-            f"0x933..0x937 — landmark rc_cal incompleto")
+            f"{func}: landmark rc_cal {sorted(hex(x) for x in have)} incompleto")
+
+
+def check_0004_0005_sources(blob):
+    """0004/0005/sensing: le routine traslitterate esistono nel blob di rif."""
+    need = ["wlc_lcnphy_set_rx_iq_comp", "wlc_lcnphy_tempsense",
+            "wlc_lcnphy_vbat_temp_sense_setup", "wlc_lcnphy_rfseq_tbl_adc_pwrup"]
+    missing = [f for f in need if f not in blob.funcs]
+    if missing:
+        return "FAIL", f"assenti nel blob: {missing}"
+    return ("OK",
+            "set_rx_iq_comp + tempsense + vbat_temp_sense_setup + "
+            "rfseq_tbl_adc_pwrup presenti: sorgenti di 0004 (cal RX), "
+            "0005 (cache) e del sensing in 0002 (rx_iq_cal stesso e\' "
+            "inlinato nel blob)")
 
 
 CHECKS = [
     ("0001", "R-cal done poll (radio 0x05c bit 0x20)", check_0001),
     ("0002", "tx gain open-loop fissi + bbmult 150", check_0002),
     ("0003", "CONFIG_B43_PHY_LCN selezionabile", check_0003),
-    ("0004", "RC-cal / RX (preflight, patch da scrivere)", check_0004_preflight),
+    ("rc_cal", "rc_cal gia` inline (0x933..0x937 = default LCNREV 1)", check_rc_cal_inline),
+    ("0004/5", "routine RX-cal/tempsense/rfseq presenti nel blob", check_0004_0005_sources),
 ]
 
 

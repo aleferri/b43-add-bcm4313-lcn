@@ -56,11 +56,12 @@ della fase 2).
 
 Fase 1:
 - [x] R-cal: aggiungere il poll del done-bit mancante in `b43_radio_2064_init` → patch 0001
-- [x] Neutralizzare `tx_pwr_ctl_init` per il legacy (open-loop a guadagno fisso, sensing rinviato) → patch 0002
+- [x] `tx_pwr_ctl_init` per il legacy: open-loop a guadagno fisso; sensing temp/vbat mantenuto, con ADC pwrup calcolato come il wl (`rfseq_tbl_adc_pwrup`, floor 1600) invece dell'hardcoded 0x640 → patch 0002
 - [x] Rendere `CONFIG_B43_PHY_LCN` selezionabile, così b43 riconosce il 4313 e prova a caricare l'ucode → patch 0003
 - [ ] Rivedere i TODO di bring-up rimasti (il ramo 5G in radio init è fuori scope: il 4313 è solo 2.4 GHz)
 - [ ] Build con `CONFIG_B43_PHY_LCN`, verificare nessun crash al probe e il self-suspend dell'ucode
-- [ ] Portare `rc_cal` + cal RX (in b43 NON c'è alcuna routine di calibrazione): è il gate per ricevere i beacon → patch 0004 (da fare)
+- [x] Cal RX (in b43 non c'era alcuna routine di calibrazione): porta `wlc_lcnphy_rx_iq_cal`, gate per ricevere i beacon → patch 0004. NB: `rc_cal` è già inline in `b43_radio_2064_init` (0x933–0x937 = default LCNREV 1), non va portato
+- [x] Cache RX-IQ per-canale + invalidazione su drift di temperatura (watchdog) → patch 0005
 - [ ] Confermare associazione + iperf a b/g
 
 Fase 2:

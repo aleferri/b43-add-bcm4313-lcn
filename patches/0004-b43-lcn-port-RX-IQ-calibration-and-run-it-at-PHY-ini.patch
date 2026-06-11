@@ -1,0 +1,710 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: A4100N LCN port <you@example.org>
+Date: Thu, 11 Jun 2026 10:09:42 +0000
+Subject: [PATCH 4/5] b43: lcn: port RX IQ calibration and run it at PHY init
+
+b43_phy_lcn_op_init() set up the LCN-PHY channel, AFE and overrides but
+left the calibration step as a bare /* TODO */, so the receive path was
+never IQ-imbalance-compensated. This is the brcmsmac PHY-init cal gate
+(wlc_lcnphy_calib_modes(PHY_PERICAL_PHYINIT) -> wlc_lcnphy_periodic_cal()):
+without its RX-IQ branch the RX coefficients (PHY regs 0x645-0x64a) are
+left at reset, which on BCM4313 means a deaf/very weak receiver.
+
+Transliterate the RX-IQ calibration closure from brcmsmac phy_lcn.c:
+deaf_mode, tx_pu, run_samples, start/stop_tx_tone, the trsw/rx-gain
+overrides, rx_iq_est, calc_rx_iq_comp and the lna2/tia/biq1 gain search,
+wired into op_init via a Phase-1 b43_phy_lcn_calib(). The whole path is
+pure PHY/radio register programming in brcmsmac (no SHM/ucode assist),
+so it maps 1:1, with mod_phy_reg(a,m,v) -> b43_phy_maskset(dev,a,~m,v&m).
+The sample-play table is b43 LCN table 0x18 (32-bit), as already used by
+b43_phy_lcn_tables_init(). Adds a spurmod flag to struct b43_phy_lcn,
+tracked alongside the existing txrx_spur_avoidance_mode() toggles.
+
+Deliberate Phase-1 deviations from brcmsmac:
+ - the cal tone is emitted at the fixed open-loop gain via
+   b43_phy_lcn_set_fixed_open_loop_gain() instead of
+   set_tx_pwr_by_index(40): b43 has no per-index tx-power table in Phase 1;
+ - wlc_lcnphy_periodic_cal()'s TX IQLO cal and TSSI table fill are skipped
+   (closed-loop tx-power, Phase 2);
+ - the tx_pwr_ctrl save/restore and the M_CTS_DURATION SHM write are
+   omitted (open-loop; b43_mac_suspend() already brackets the cal);
+ - rx_iq_cal's module==2 path (apply a stored table) is not ported here;
+   PHY-init always runs module 1. The per-channel cache is a later patch.
+
+Review hot-spots for the next reviewer with the source/hardware:
+ - calc_rx_iq_comp() fixed-point math (nbits/arsh/brsh shifts, int_sqrt);
+ - start_tx_tone() CORDIC angle scaling and CORDIC_FLOAT() must be
+   reconciled with the kernel <linux/cordic.h> API (brcmsmac used its
+   own CORDIC), see the FIXME.
+
+NOT validated on hardware. Part of the LCN-PHY (BCM4313) bring-up for
+the A4100N.
+
+Signed-off-by: A4100N LCN port <you@example.org>
+---
+ drivers/net/wireless/broadcom/b43/phy_lcn.c | 608 ++++++++++++++++++++
+ drivers/net/wireless/broadcom/b43/phy_lcn.h |   1 +
+ 2 files changed, 609 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/b43/phy_lcn.c b/drivers/net/wireless/broadcom/b43/phy_lcn.c
+index c270691..1697367 100644
+--- a/drivers/net/wireless/broadcom/b43/phy_lcn.c
++++ b/drivers/net/wireless/broadcom/b43/phy_lcn.c
+@@ -37,6 +37,8 @@
+ #include "tables_phy_lcn.h"
+ #include "main.h"
+ 
++#include <linux/cordic.h>
++
+ struct lcn_tx_gains {
+ 	u16 gm_gain;
+ 	u16 pga_gain;
+@@ -651,6 +653,7 @@ static void b43_phy_lcn_set_channel_tweaks(struct b43_wldev *dev, int channel)
+ 		b43_phy_write(dev, 0x942, 0);
+ 
+ 		b43_phy_lcn_txrx_spur_avoidance_mode(dev, false);
++		dev->phy.lcn->spurmod = false;
+ 		b43_phy_maskset(dev, 0x424, (u16) ~0xff00, 0x1b00);
+ 		b43_phy_write(dev, 0x425, 0x5907);
+ 	} else {
+@@ -663,6 +666,7 @@ static void b43_phy_lcn_set_channel_tweaks(struct b43_wldev *dev, int channel)
+ 		b43_phy_write(dev, 0x942, 0);
+ 
+ 		b43_phy_lcn_txrx_spur_avoidance_mode(dev, true);
++		dev->phy.lcn->spurmod = true;
+ 		b43_phy_maskset(dev, 0x424, (u16) ~0xff00, 0x1f00);
+ 		b43_phy_write(dev, 0x425, 0x590a);
+ 	}
+@@ -711,6 +715,608 @@ static int b43_phy_lcn_set_channel(struct b43_wldev *dev,
+ 	return 0;
+ }
+ 
++/**************************************************
++ * RX IQ / periodic calibration.
++ *
++ * Transliterated from brcmsmac phy_lcn.c. brcmsmac drives the PHY-init
++ * calibration via wlc_lcnphy_calib_modes(PHY_PERICAL_PHYINIT) ->
++ * wlc_lcnphy_periodic_cal(), whose RX-IQ branch is the gate for receiving
++ * (it sets the RX IQ-imbalance compensation coefficients). The whole path
++ * below is pure PHY/radio register programming in brcmsmac (no SHM/ucode
++ * assist), so it transliterates 1:1.
++ *
++ * Phase-1 deviations from brcmsmac, all deliberate (see commit message):
++ *  - the cal tone is emitted at a fixed open-loop TX gain instead of
++ *    wlc_lcnphy_set_tx_pwr_by_index(): b43 does not build the per-index
++ *    tx-power-control table in Phase 1 (see patch 0002), so an index lookup
++ *    would read an unpopulated table;
++ *  - wlc_lcnphy_periodic_cal()'s TX IQLO cal and TSSI table fill are skipped
++ *    (closed-loop tx-power, Phase 2);
++ *  - the tx_pwr_ctrl save/restore and the M_CTS_DURATION SHM write are
++ *    omitted (open-loop; b43_mac_suspend() already brackets the cal).
++ **************************************************/
++
++struct b43_lcn_iq_est {
++	u32 iq_prod;
++	u32 i_pwr;
++	u32 q_pwr;
++};
++
++/* wlc_phy_nbits */
++static int b43_phy_lcn_nbits(s32 value)
++{
++	s32 abs_val = abs(value);
++	int nbits = 0;
++
++	while ((abs_val >> nbits) > 0)
++		nbits++;
++	return nbits;
++}
++
++/* wlc_lcnphy_set_rx_iq_comp */
++static void b43_phy_lcn_set_rx_iq_comp(struct b43_wldev *dev, u16 a, u16 b)
++{
++	b43_phy_maskset(dev, 0x645, (u16)~(0x3ff << 0), a << 0);
++	b43_phy_maskset(dev, 0x646, (u16)~(0x3ff << 0), b << 0);
++	b43_phy_maskset(dev, 0x647, (u16)~(0x3ff << 0), a << 0);
++	b43_phy_maskset(dev, 0x648, (u16)~(0x3ff << 0), b << 0);
++	b43_phy_maskset(dev, 0x649, (u16)~(0x3ff << 0), a << 0);
++	b43_phy_maskset(dev, 0x64a, (u16)~(0x3ff << 0), b << 0);
++}
++
++/* wlc_lcnphy_set_trsw_override */
++static void b43_phy_lcn_set_trsw_override(struct b43_wldev *dev, bool tx,
++					  bool rx)
++{
++	b43_phy_maskset(dev, 0x44d, (u16)~((0x1 << 1) | (0x1 << 0)),
++			(tx ? (0x1 << 1) : 0) | (rx ? (0x1 << 0) : 0));
++	b43_phy_set(dev, 0x44c, (0x1 << 1) | (0x1 << 0));
++}
++
++/* wlc_lcnphy_clear_trsw_override */
++static void b43_phy_lcn_clear_trsw_override(struct b43_wldev *dev)
++{
++	b43_phy_mask(dev, 0x44c, (u16)~((0x1 << 1) | (0x1 << 0)));
++}
++
++/* wlc_lcnphy_rx_gain_override_enable */
++static void b43_phy_lcn_rx_gain_override_enable(struct b43_wldev *dev,
++						bool enable)
++{
++	u16 ebit = enable ? 1 : 0;
++
++	b43_phy_maskset(dev, 0x4b0, (u16)~(0x1 << 8), ebit << 8);
++	b43_phy_maskset(dev, 0x44c, (u16)~(0x1 << 0), ebit << 0);
++
++	if (dev->phy.rev < 2) {
++		b43_phy_maskset(dev, 0x44c, (u16)~(0x1 << 4), ebit << 4);
++		b43_phy_maskset(dev, 0x44c, (u16)~(0x1 << 6), ebit << 6);
++		b43_phy_maskset(dev, 0x4b0, (u16)~(0x1 << 5), ebit << 5);
++		b43_phy_maskset(dev, 0x4b0, (u16)~(0x1 << 6), ebit << 6);
++	} else {
++		b43_phy_maskset(dev, 0x4b0, (u16)~(0x1 << 12), ebit << 12);
++		b43_phy_maskset(dev, 0x4b0, (u16)~(0x1 << 13), ebit << 13);
++		b43_phy_maskset(dev, 0x4b0, (u16)~(0x1 << 5), ebit << 5);
++	}
++
++	if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ) {
++		b43_phy_maskset(dev, 0x4b0, (u16)~(0x1 << 10), ebit << 10);
++		b43_phy_maskset(dev, 0x4e5, (u16)~(0x1 << 3), ebit << 3);
++	}
++}
++
++/* wlc_lcnphy_set_rx_gain_by_distribution */
++static void b43_phy_lcn_set_rx_gain_by_distribution(struct b43_wldev *dev,
++						    u16 trsw, u16 ext_lna,
++						    u16 biq2, u16 biq1,
++						    u16 tia, u16 lna2, u16 lna1)
++{
++	u16 gain0_15, gain16_19;
++
++	gain16_19 = biq2 & 0xf;
++	gain0_15 = ((biq1 & 0xf) << 12) |
++		   ((tia & 0xf) << 8) |
++		   ((lna2 & 0x3) << 6) |
++		   ((lna2 & 0x3) << 4) |
++		   ((lna1 & 0x3) << 2) |
++		   ((lna1 & 0x3) << 0);
++
++	b43_phy_maskset(dev, 0x4b6, (u16)~(0xffff << 0), gain0_15 << 0);
++	b43_phy_maskset(dev, 0x4b7, (u16)~(0xf << 0), gain16_19 << 0);
++	b43_phy_maskset(dev, 0x4b1, (u16)~(0x3 << 11), lna1 << 11);
++
++	if (dev->phy.rev < 2) {
++		b43_phy_maskset(dev, 0x4b1, (u16)~(0x1 << 9), ext_lna << 9);
++		b43_phy_maskset(dev, 0x4b1, (u16)~(0x1 << 10), ext_lna << 10);
++	} else {
++		b43_phy_maskset(dev, 0x4b1, (u16)~(0x1 << 10), 0 << 10);
++		b43_phy_maskset(dev, 0x4b1, (u16)~(0x1 << 15), 0 << 15);
++		b43_phy_maskset(dev, 0x4b1, (u16)~(0x1 << 9), ext_lna << 9);
++	}
++
++	b43_phy_maskset(dev, 0x44d, (u16)~(0x1 << 0), (!trsw) << 0);
++}
++
++/* wlc_lcnphy_deaf_mode */
++static void b43_phy_lcn_deaf_mode(struct b43_wldev *dev, bool mode)
++{
++	bool is2g = b43_current_band(dev->wl) == NL80211_BAND_2GHZ;
++
++	/* Phase 1: 2.4 GHz, 20 MHz only, so phybw40 == 0 (HT40 is Phase 2) */
++	b43_phy_maskset(dev, 0x4b0, (u16)~(0x1 << 5), mode << 5);
++	b43_phy_maskset(dev, 0x4b1, (u16)~(0x1 << 9), 0 << 9);
++
++	b43_phy_maskset(dev, 0x410, (u16)~((0x1 << 6) | (0x1 << 5)),
++			((is2g ? !mode : 0) << 6) | ((!mode) << 5));
++	b43_phy_maskset(dev, 0x410, (u16)~(0x1 << 7), mode << 7);
++}
++
++/* wlc_lcnphy_tx_pu */
++static void b43_phy_lcn_tx_pu(struct b43_wldev *dev, bool enable)
++{
++	if (!enable) {
++		b43_phy_mask(dev, 0x43b, (u16)~((0x1 << 1) | (0x1 << 4)));
++		b43_phy_maskset(dev, 0x43c, (u16)~(0x1 << 1), 1 << 1);
++		b43_phy_mask(dev, 0x44c,
++			     (u16)~((0x1 << 3) | (0x1 << 5) | (0x1 << 12) |
++				    (0x1 << 0) | (0x1 << 1) | (0x1 << 2)));
++		b43_phy_mask(dev, 0x44d,
++			     (u16)~((0x1 << 3) | (0x1 << 5) | (0x1 << 14)));
++		b43_phy_maskset(dev, 0x44d, (u16)~(0x1 << 2), 1 << 2);
++		b43_phy_maskset(dev, 0x44d, (u16)~((0x1 << 1) | (0x1 << 0)),
++				(0x1 << 0));
++		b43_phy_mask(dev, 0x4f9,
++			     (u16)~((0x1 << 0) | (0x1 << 1) | (0x1 << 2)));
++		b43_phy_mask(dev, 0x4fa,
++			     (u16)~((0x1 << 0) | (0x1 << 1) | (0x1 << 2)));
++	} else {
++		b43_phy_maskset(dev, 0x43b, (u16)~(0x1 << 1), 1 << 1);
++		b43_phy_maskset(dev, 0x43c, (u16)~(0x1 << 1), 0 << 1);
++		b43_phy_maskset(dev, 0x43b, (u16)~(0x1 << 4), 1 << 4);
++		b43_phy_maskset(dev, 0x43c, (u16)~(0x1 << 6), 0 << 6);
++		b43_phy_maskset(dev, 0x44c, (u16)~(0x1 << 12), 1 << 12);
++		b43_phy_maskset(dev, 0x44d, (u16)~(0x1 << 14), 1 << 14);
++
++		b43_phy_lcn_set_trsw_override(dev, true, false);
++
++		b43_phy_maskset(dev, 0x44d, (u16)~(0x1 << 2), 0 << 2);
++		b43_phy_maskset(dev, 0x44c, (u16)~(0x1 << 2), 1 << 2);
++
++		if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ) {
++			b43_phy_maskset(dev, 0x44c, (u16)~(0x1 << 3), 1 << 3);
++			b43_phy_maskset(dev, 0x44d, (u16)~(0x1 << 3), 1 << 3);
++			b43_phy_maskset(dev, 0x44c, (u16)~(0x1 << 5), 1 << 5);
++			b43_phy_maskset(dev, 0x44d, (u16)~(0x1 << 5), 0 << 5);
++			b43_phy_maskset(dev, 0x4f9, (u16)~(0x1 << 1), 1 << 1);
++			b43_phy_maskset(dev, 0x4fa, (u16)~(0x1 << 1), 1 << 1);
++			b43_phy_maskset(dev, 0x4f9, (u16)~(0x1 << 2), 1 << 2);
++			b43_phy_maskset(dev, 0x4fa, (u16)~(0x1 << 2), 1 << 2);
++			b43_phy_maskset(dev, 0x4f9, (u16)~(0x1 << 0), 1 << 0);
++			b43_phy_maskset(dev, 0x4fa, (u16)~(0x1 << 0), 1 << 0);
++		} else {
++			b43_phy_maskset(dev, 0x44c, (u16)~(0x1 << 3), 1 << 3);
++			b43_phy_maskset(dev, 0x44d, (u16)~(0x1 << 3), 0 << 3);
++			b43_phy_maskset(dev, 0x44c, (u16)~(0x1 << 5), 1 << 5);
++			b43_phy_maskset(dev, 0x44d, (u16)~(0x1 << 5), 1 << 5);
++			b43_phy_maskset(dev, 0x4f9, (u16)~(0x1 << 1), 1 << 1);
++			b43_phy_maskset(dev, 0x4fa, (u16)~(0x1 << 1), 0 << 1);
++			b43_phy_maskset(dev, 0x4f9, (u16)~(0x1 << 2), 1 << 2);
++			b43_phy_maskset(dev, 0x4fa, (u16)~(0x1 << 2), 0 << 2);
++			b43_phy_maskset(dev, 0x4f9, (u16)~(0x1 << 0), 1 << 0);
++			b43_phy_maskset(dev, 0x4fa, (u16)~(0x1 << 0), 0 << 0);
++		}
++	}
++}
++
++/* wlc_lcnphy_run_samples */
++static void b43_phy_lcn_run_samples(struct b43_wldev *dev, u16 num_samps,
++				    u16 num_loops, u16 wait, bool iqcalmode)
++{
++	b43_phy_set(dev, 0x6da, 0x8080);
++	b43_phy_maskset(dev, 0x642, (u16)~(0x7f << 0), (num_samps - 1) << 0);
++	if (num_loops != 0xffff)
++		num_loops--;
++	b43_phy_maskset(dev, 0x640, (u16)~(0xffff << 0), num_loops << 0);
++	b43_phy_maskset(dev, 0x641, (u16)~(0xffff << 0), wait << 0);
++
++	if (iqcalmode) {
++		b43_phy_mask(dev, 0x453, 0xffff & ~(0x1 << 15));
++		b43_phy_set(dev, 0x453, (0x1 << 15));
++	} else {
++		b43_phy_write(dev, 0x63f, 1);
++		b43_phy_lcn_tx_pu(dev, 1);
++	}
++
++	b43_radio_set(dev, 0x112, 0x6);
++}
++
++/* wlc_lcnphy_start_tx_tone */
++static void b43_phy_lcn_start_tx_tone(struct b43_wldev *dev, s32 f_kHz,
++				      u16 max_val, bool iqcalmode)
++{
++	u8 phy_bw;
++	u16 num_samps, t, k;
++	u32 bw;
++	s32 theta = 0, rot = 0;
++	struct cordic_iq tone_samp;
++	u32 data_buf[64];
++	u16 i_samp, q_samp;
++
++	b43_phy_lcn_deaf_mode(dev, true);
++
++	phy_bw = 40;
++	if (dev->phy.lcn->spurmod) {
++		b43_phy_write(dev, 0x942, 0x2);
++		b43_phy_write(dev, 0x93b, 0x0);
++		b43_phy_write(dev, 0x93c, 0x0);
++		b43_phy_lcn_txrx_spur_avoidance_mode(dev, false);
++	}
++
++	if (f_kHz) {
++		k = 1;
++		do {
++			bw = phy_bw * 1000 * k;
++			num_samps = bw / abs(f_kHz);
++			k++;
++		} while ((num_samps * (u32)abs(f_kHz)) != bw);
++	} else {
++		num_samps = 2;
++	}
++
++	rot = ((f_kHz * 36) / phy_bw) / 100;
++	theta = 0;
++
++	for (t = 0; t < num_samps; t++) {
++		/*
++		 * FIXME: brcmsmac uses its own CORDIC (brcmutil) with
++		 * CORDIC_FLOAT(); reconcile the angle scaling of rot/theta and
++		 * the output Q-format with the kernel <linux/cordic.h>
++		 * cordic_calc_iq() before trusting the emitted tone.
++		 */
++		tone_samp = cordic_calc_iq(theta);
++		theta += rot;
++		i_samp = (u16)(CORDIC_FLOAT(tone_samp.i * max_val) & 0x3ff);
++		q_samp = (u16)(CORDIC_FLOAT(tone_samp.q * max_val) & 0x3ff);
++		data_buf[t] = (i_samp << 10) | q_samp;
++	}
++
++	b43_phy_maskset(dev, 0x6d6, (u16)~(0x3 << 0), 0 << 0);
++	b43_phy_maskset(dev, 0x6da, (u16)~(0x1 << 3), 1 << 3);
++
++	/* LCNPHY_TBL_ID_SAMPLEPLAY == b43 LCN table 0x18 (32-bit) */
++	b43_lcntab_write_bulk(dev, B43_LCNTAB32(0x18, 0), num_samps, data_buf);
++
++	b43_phy_lcn_run_samples(dev, num_samps, 0xffff, 0, iqcalmode);
++}
++
++/* wlc_lcnphy_stop_tx_tone */
++static void b43_phy_lcn_stop_tx_tone(struct b43_wldev *dev)
++{
++	s16 playback_status;
++
++	if (dev->phy.lcn->spurmod) {
++		b43_phy_write(dev, 0x942, 0x7);
++		b43_phy_write(dev, 0x93b, 0x2017);
++		b43_phy_write(dev, 0x93c, 0x27c5);
++		b43_phy_lcn_txrx_spur_avoidance_mode(dev, true);
++	}
++
++	playback_status = b43_phy_read(dev, 0x644);
++	if (playback_status & (0x1 << 0)) {
++		b43_phy_lcn_tx_pu(dev, 0);
++		b43_phy_maskset(dev, 0x63f, (u16)~(0x1 << 1), 1 << 1);
++	} else if (playback_status & (0x1 << 1)) {
++		b43_phy_maskset(dev, 0x453, (u16)~(0x1 << 15), 0 << 15);
++	}
++
++	b43_phy_maskset(dev, 0x6d6, (u16)~(0x3 << 0), 1 << 0);
++	b43_phy_maskset(dev, 0x6da, (u16)~(0x1 << 3), 0 << 3);
++	b43_phy_maskset(dev, 0x6da, (u16)~(0x1 << 7), 0 << 7);
++
++	b43_radio_mask(dev, 0x112, 0xfff9);
++
++	b43_phy_lcn_deaf_mode(dev, false);
++}
++
++/* wlc_lcnphy_rx_iq_est */
++static bool b43_phy_lcn_rx_iq_est(struct b43_wldev *dev, u16 num_samps,
++				  u8 wait_time, struct b43_lcn_iq_est *iq_est)
++{
++	int wait_count = 0;
++	bool result = true;
++
++	b43_phy_maskset(dev, 0x6da, (u16)~(0x1 << 5), 1 << 5);
++	b43_phy_maskset(dev, 0x410, (u16)~(0x1 << 3), 0 << 3);
++	b43_phy_maskset(dev, 0x482, (u16)~(0xffff << 0), num_samps << 0);
++	b43_phy_maskset(dev, 0x481, (u16)~(0xff << 0), (u16)wait_time << 0);
++	b43_phy_maskset(dev, 0x481, (u16)~(0x1 << 8), 0 << 8);
++	b43_phy_maskset(dev, 0x481, (u16)~(0x1 << 9), 1 << 9);
++
++	while (b43_phy_read(dev, 0x481) & (0x1 << 9)) {
++		if (wait_count > (10 * 500)) {
++			result = false;
++			goto cleanup;
++		}
++		udelay(100);
++		wait_count++;
++	}
++
++	iq_est->iq_prod = ((u32)b43_phy_read(dev, 0x483) << 16) |
++			  (u32)b43_phy_read(dev, 0x484);
++	iq_est->i_pwr = ((u32)b43_phy_read(dev, 0x485) << 16) |
++			(u32)b43_phy_read(dev, 0x486);
++	iq_est->q_pwr = ((u32)b43_phy_read(dev, 0x487) << 16) |
++			(u32)b43_phy_read(dev, 0x488);
++
++cleanup:
++	b43_phy_maskset(dev, 0x410, (u16)~(0x1 << 3), 1 << 3);
++	b43_phy_maskset(dev, 0x6da, (u16)~(0x1 << 5), 0 << 5);
++	return result;
++}
++
++/* wlc_lcnphy_calc_rx_iq_comp */
++static bool b43_phy_lcn_calc_rx_iq_comp(struct b43_wldev *dev, u16 num_samps)
++{
++#define B43_LCN_MIN_RXIQ_PWR 2
++	bool result;
++	u16 a0_new, b0_new;
++	struct b43_lcn_iq_est iq_est = { 0, 0, 0 };
++	s32 a, b, temp;
++	s16 iq_nbits, qq_nbits, arsh, brsh;
++	s32 iq;
++	u32 ii, qq;
++
++	a0_new = b43_phy_read(dev, 0x645) & (0x3ff << 0);
++	b0_new = b43_phy_read(dev, 0x646) & (0x3ff << 0);
++	b43_phy_maskset(dev, 0x6d1, (u16)~(0x1 << 2), 0 << 2);
++	b43_phy_maskset(dev, 0x64b, (u16)~(0x1 << 6), 1 << 6);
++
++	b43_phy_lcn_set_rx_iq_comp(dev, 0, 0);
++
++	result = b43_phy_lcn_rx_iq_est(dev, num_samps, 32, &iq_est);
++	if (!result)
++		goto cleanup;
++
++	iq = (s32)iq_est.iq_prod;
++	ii = iq_est.i_pwr;
++	qq = iq_est.q_pwr;
++
++	if ((ii + qq) < B43_LCN_MIN_RXIQ_PWR) {
++		result = false;
++		goto cleanup;
++	}
++
++	iq_nbits = b43_phy_lcn_nbits(iq);
++	qq_nbits = b43_phy_lcn_nbits(qq);
++
++	arsh = 10 - (30 - iq_nbits);
++	if (arsh >= 0) {
++		a = -(iq << (30 - iq_nbits)) + (ii >> (1 + arsh));
++		temp = (s32)(ii >> arsh);
++		if (temp == 0)
++			return false;
++	} else {
++		a = -(iq << (30 - iq_nbits)) + (ii << (-1 - arsh));
++		temp = (s32)(ii << -arsh);
++		if (temp == 0)
++			return false;
++	}
++	a /= temp;
++
++	brsh = qq_nbits - 31 + 20;
++	if (brsh >= 0) {
++		b = qq << (31 - qq_nbits);
++		temp = (s32)(ii >> brsh);
++		if (temp == 0)
++			return false;
++	} else {
++		b = qq << (31 - qq_nbits);
++		temp = (s32)(ii << -brsh);
++		if (temp == 0)
++			return false;
++	}
++	b /= temp;
++	b -= a * a;
++	b = (s32)int_sqrt((unsigned long)b);
++	b -= (1 << 10);
++
++	a0_new = (u16)(a & 0x3ff);
++	b0_new = (u16)(b & 0x3ff);
++cleanup:
++	b43_phy_lcn_set_rx_iq_comp(dev, a0_new, b0_new);
++	b43_phy_maskset(dev, 0x64b, (u16)~(0x1 << 0), 1 << 0);
++	b43_phy_maskset(dev, 0x64b, (u16)~(0x1 << 3), 1 << 3);
++
++	return result;
++}
++
++/* wlc_lcnphy_rx_iq_cal_gain */
++static bool b43_phy_lcn_rx_iq_cal_gain(struct b43_wldev *dev, u16 biq1_gain,
++				       u16 tia_gain, u16 lna2_gain)
++{
++	u32 i_thresh_l, q_thresh_l;
++	u32 i_thresh_h, q_thresh_h;
++	struct b43_lcn_iq_est iq_est_h, iq_est_l;
++
++	b43_phy_lcn_set_rx_gain_by_distribution(dev, 0, 0, 0, biq1_gain,
++						tia_gain, lna2_gain, 0);
++	b43_phy_lcn_rx_gain_override_enable(dev, true);
++
++	b43_phy_lcn_start_tx_tone(dev, 2000, (40 >> 1), 0);
++	udelay(500);
++	b43_radio_write(dev, 0x112, 0);
++	if (!b43_phy_lcn_rx_iq_est(dev, 1024, 32, &iq_est_l))
++		return false;
++
++	b43_phy_lcn_start_tx_tone(dev, 2000, 40, 0);
++	udelay(500);
++	b43_radio_write(dev, 0x112, 0);
++	if (!b43_phy_lcn_rx_iq_est(dev, 1024, 32, &iq_est_h))
++		return false;
++
++	i_thresh_l = iq_est_l.i_pwr << 1;
++	i_thresh_h = (iq_est_l.i_pwr << 2) + iq_est_l.i_pwr;
++	q_thresh_l = iq_est_l.q_pwr << 1;
++	q_thresh_h = (iq_est_l.q_pwr << 2) + iq_est_l.q_pwr;
++
++	if ((iq_est_h.i_pwr > i_thresh_l) && (iq_est_h.i_pwr < i_thresh_h) &&
++	    (iq_est_h.q_pwr > q_thresh_l) && (iq_est_h.q_pwr < q_thresh_h))
++		return true;
++
++	return false;
++}
++
++/* radio registers saved/restored across RX IQ cal (rxiq_cal_rf_reg) */
++static const u16 b43_lcn_rxiq_cal_rf_reg[11] = {
++	0x098, 0x116, 0x12c, 0x06a, 0x00b, 0x01b,
++	0x113, 0x01d, 0x114, 0x02e, 0x12a,
++};
++
++/*
++ * wlc_lcnphy_rx_iq_cal, module == 1 (measurement) path only.
++ *
++ * The module == 2 path (apply a stored per-channel iqcomp table) is not
++ * ported: PHY-init cal always runs module 1. tx_switch=true, rx_switch=false,
++ * tx_gain_idx=40 (rev 1) match brcmsmac's PHY-init call.
++ */
++static void b43_phy_lcn_rx_iq_cal(struct b43_wldev *dev)
++{
++	u16 values_to_save[11];
++	u16 core1txctl_old;
++	u16 rfoverride0val_old, rfoverride2_old, rfoverride2val_old;
++	u16 rfoverride3_old, rfoverride3val_old, rfoverride4_old;
++	u16 rfoverride4val_old, afectrlovr_old, afectrlovrval_old;
++	u16 old_calib_clk, old_rxfe_clk;
++	int tia_gain, lna2_gain, biq1_gain;
++	bool set_gain;
++	int i;
++
++	for (i = 0; i < 11; i++)
++		values_to_save[i] =
++			b43_radio_read(dev, b43_lcn_rxiq_cal_rf_reg[i]);
++	core1txctl_old = b43_phy_read(dev, 0x631);
++
++	b43_phy_set(dev, 0x631, 0x0015);
++
++	b43_phy_read(dev, 0x44c); /* RFOverride0_old (discarded, as brcmsmac) */
++	rfoverride0val_old = b43_phy_read(dev, 0x44d);
++	rfoverride2_old = b43_phy_read(dev, 0x4b0);
++	rfoverride2val_old = b43_phy_read(dev, 0x4b1);
++	rfoverride3_old = b43_phy_read(dev, 0x4f9);
++	rfoverride3val_old = b43_phy_read(dev, 0x4fa);
++	rfoverride4_old = b43_phy_read(dev, 0x938);
++	rfoverride4val_old = b43_phy_read(dev, 0x939);
++	afectrlovr_old = b43_phy_read(dev, 0x43b);
++	afectrlovrval_old = b43_phy_read(dev, 0x43c);
++	old_calib_clk = b43_phy_read(dev, 0x6da);
++	old_rxfe_clk = b43_phy_read(dev, 0x6db);
++
++	/*
++	 * Phase-1 deviation from brcmsmac: instead of
++	 * wlc_lcnphy_set_tx_pwr_by_index(dev, 40) — which reads an
++	 * unpopulated per-index tx-power table in b43 — drive the cal tone at
++	 * the fixed 2.4 GHz open-loop gain (same tuple as the legacy bring-up,
++	 * patch 0002). b43_phy_lcn_set_tx_gain() also enables the TX gain
++	 * override.
++	 */
++	b43_phy_lcn_set_fixed_open_loop_gain(dev);
++
++	b43_phy_maskset(dev, 0x4f9, (u16)~(0x1 << 0), 1 << 0);
++	b43_phy_maskset(dev, 0x4fa, (u16)~(0x1 << 0), 0 << 0);
++	b43_phy_maskset(dev, 0x43b, (u16)~(0x1 << 1), 1 << 1);
++	b43_phy_maskset(dev, 0x43c, (u16)~(0x1 << 1), 0 << 1);
++
++	b43_radio_write(dev, 0x116, 0x06);
++	b43_radio_write(dev, 0x12c, 0x07);
++	b43_radio_write(dev, 0x06a, 0xd3);
++	b43_radio_write(dev, 0x098, 0x03);
++	b43_radio_write(dev, 0x00b, 0x7);
++	b43_radio_maskset(dev, 0x113, (u16)~(1 << 4), 1 << 4);
++	b43_radio_write(dev, 0x01d, 0x01);
++	b43_radio_write(dev, 0x114, 0x01);
++	b43_radio_write(dev, 0x02e, 0x10);
++	b43_radio_write(dev, 0x12a, 0x08);
++
++	b43_phy_maskset(dev, 0x938, (u16)~(0x1 << 0), 1 << 0);
++	b43_phy_maskset(dev, 0x939, (u16)~(0x1 << 0), 0 << 0);
++	b43_phy_maskset(dev, 0x938, (u16)~(0x1 << 1), 1 << 1);
++	b43_phy_maskset(dev, 0x939, (u16)~(0x1 << 1), 1 << 1);
++	b43_phy_maskset(dev, 0x938, (u16)~(0x1 << 2), 1 << 2);
++	b43_phy_maskset(dev, 0x939, (u16)~(0x1 << 2), 1 << 2);
++	b43_phy_maskset(dev, 0x938, (u16)~(0x1 << 3), 1 << 3);
++	b43_phy_maskset(dev, 0x939, (u16)~(0x1 << 3), 1 << 3);
++	b43_phy_maskset(dev, 0x938, (u16)~(0x1 << 5), 1 << 5);
++	b43_phy_maskset(dev, 0x939, (u16)~(0x1 << 5), 0 << 5);
++
++	b43_phy_maskset(dev, 0x43b, (u16)~(0x1 << 0), 1 << 0);
++	b43_phy_maskset(dev, 0x43c, (u16)~(0x1 << 0), 0 << 0);
++
++	b43_phy_write(dev, 0x6da, 0xffff);
++	b43_phy_set(dev, 0x6db, 0x3);
++
++	b43_phy_lcn_set_trsw_override(dev, true, false);
++
++	for (lna2_gain = 3; lna2_gain >= 0; lna2_gain--) {
++		for (tia_gain = 4; tia_gain >= 0; tia_gain--) {
++			for (biq1_gain = 6; biq1_gain >= 0; biq1_gain--) {
++				set_gain = b43_phy_lcn_rx_iq_cal_gain(dev,
++								      biq1_gain,
++								      tia_gain,
++								      lna2_gain);
++				if (!set_gain)
++					continue;
++				b43_phy_lcn_calc_rx_iq_comp(dev, 1024);
++				goto stop_tone;
++			}
++		}
++	}
++
++stop_tone:
++	b43_phy_lcn_stop_tx_tone(dev);
++
++	b43_phy_write(dev, 0x631, core1txctl_old);
++	b43_phy_write(dev, 0x44c, rfoverride0val_old);
++	b43_phy_write(dev, 0x44d, rfoverride0val_old);
++	b43_phy_write(dev, 0x4b0, rfoverride2_old);
++	b43_phy_write(dev, 0x4b1, rfoverride2val_old);
++	b43_phy_write(dev, 0x4f9, rfoverride3_old);
++	b43_phy_write(dev, 0x4fa, rfoverride3val_old);
++	b43_phy_write(dev, 0x938, rfoverride4_old);
++	b43_phy_write(dev, 0x939, rfoverride4val_old);
++	b43_phy_write(dev, 0x43b, afectrlovr_old);
++	b43_phy_write(dev, 0x43c, afectrlovrval_old);
++	b43_phy_write(dev, 0x6da, old_calib_clk);
++	b43_phy_write(dev, 0x6db, old_rxfe_clk);
++
++	b43_phy_lcn_clear_trsw_override(dev);
++	b43_phy_maskset(dev, 0x44c, (u16)~(0x1 << 2), 0 << 2);
++
++	for (i = 0; i < 11; i++)
++		b43_radio_write(dev, b43_lcn_rxiq_cal_rf_reg[i],
++				values_to_save[i]);
++
++	/* Phase 1: re-apply the fixed open-loop gain (no index to restore) */
++	b43_phy_lcn_set_fixed_open_loop_gain(dev);
++
++	b43_phy_lcn_rx_gain_override_enable(dev, false);
++}
++
++/*
++ * wlc_lcnphy_calib_modes(PHY_PERICAL_PHYINIT) -> wlc_lcnphy_periodic_cal().
++ * Phase-1 RX spine only: TX IQLO cal and the TSSI table fill (closed-loop
++ * tx-power) are Phase 2.
++ */
++static void b43_phy_lcn_calib(struct b43_wldev *dev)
++{
++	b43_mac_suspend(dev);
++
++	b43_phy_lcn_deaf_mode(dev, true);
++	b43_phy_lcn_rx_iq_cal(dev);
++	b43_phy_lcn_deaf_mode(dev, false);
++
++	b43_mac_enable(dev);
++}
++
+ /**************************************************
+  * Basic PHY ops.
+  **************************************************/
+@@ -786,6 +1392,8 @@ static int b43_phy_lcn_op_init(struct b43_wldev *dev)
+ 
+ 	/* TODO */
+ 
++	b43_phy_lcn_calib(dev);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/wireless/broadcom/b43/phy_lcn.h b/drivers/net/wireless/broadcom/b43/phy_lcn.h
+index 0b1cfaf..29d9483 100644
+--- a/drivers/net/wireless/broadcom/b43/phy_lcn.h
++++ b/drivers/net/wireless/broadcom/b43/phy_lcn.h
+@@ -23,6 +23,7 @@ struct b43_phy_lcn {
+ 	bool hw_pwr_ctl;
+ 	bool hw_pwr_ctl_capable;
+ 	u8 tx_pwr_curr_idx;
++	bool spurmod;
+ };
+ 
+ 
+-- 
+2.43.0
+

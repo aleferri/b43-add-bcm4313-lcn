@@ -1,44 +1,143 @@
-From 9a70329538bc800b41f1de3f759c8ccfb9607db0 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: A4100N LCN port <you@example.org>
 Date: Thu, 11 Jun 2026 10:08:21 +0000
 Subject: [PATCH 2/3] b43: lcn: pin TX power to fixed open-loop gain for legacy
  bring-up
 
 b43_phy_lcn_tx_pwr_ctl_init() programmed a fixed TX gain only on the
-!hw_pwr_ctl_capable path and then ran b43_phy_lcn_sense_setup(), which
-relies on the still-unfinished tx-power-by-index path (TODOs there),
-does a dummy transmission and touches ucode-assisted calibration. For
-Phase 1 we only need the PHY to come up and pass legacy (b/g) traffic.
+!hw_pwr_ctl_capable path. Closed-loop (hardware) TX power control depends
+on the tx-power-by-index path b43 does not build yet, so pin a fixed
+open-loop gain for the 2.4 GHz legacy bring-up and drop the
+hw_pwr_ctl_capable branch (Phase 2).
 
-Force the open-loop fixed-gain path unconditionally and drop the sensing
-call. This mirrors brcmsmac's !hw_pwr_ctl behaviour minus calibration.
-Real (closed-loop) TX power control and temperature/vbat sensing are
-deferred to Phase 2; b43_phy_lcn_sense_setup() is kept but marked
-__maybe_unused until then.
+Keep the temperature/vbat sensing mainline runs here, but fix
+b43_phy_lcn_sense_setup() so it no longer relies on TODO/FIXME shortcuts:
+
+ - the LCN table-8 entry is computed by b43_phy_lcn_rfseq_tbl_adc_pwrup()
+   (the ADC power-up time derived from the AFE/Rx-gain regs 0x4a5/0x40d/
+   0x4a2, floored at 1600), as the wl blob does, instead of the hardcoded
+   0x640 -- which was only that floor;
+ - where the blob calls set_tx_pwr_by_index(127) (and restores the saved
+   index) to gain the sensing dummy frame, use the fixed open-loop gain,
+   since the per-index tx-power table is not built in Phase 1.
+
+The fixed-gain program is factored into
+b43_phy_lcn_set_fixed_open_loop_gain() and reused by the sensing path.
 
 NOT validated on hardware. Part of the LCN-PHY (BCM4313) bring-up for
 the A4100N.
 
 Signed-off-by: A4100N LCN port <you@example.org>
 ---
- drivers/net/wireless/broadcom/b43/phy_lcn.c | 40 +++++++++++----------
- 1 file changed, 21 insertions(+), 19 deletions(-)
+ drivers/net/wireless/broadcom/b43/phy_lcn.c | 95 +++++++++++++++------
+ 1 file changed, 68 insertions(+), 27 deletions(-)
 
 diff --git a/drivers/net/wireless/broadcom/b43/phy_lcn.c b/drivers/net/wireless/broadcom/b43/phy_lcn.c
-index 3ef30be..cca39dd 100644
+index 8b60bdf..c270691 100644
 --- a/drivers/net/wireless/broadcom/b43/phy_lcn.c
 +++ b/drivers/net/wireless/broadcom/b43/phy_lcn.c
-@@ -316,7 +316,7 @@ static void b43_phy_lcn_bu_tweaks(struct b43_wldev *dev)
+@@ -315,6 +315,25 @@ static void b43_phy_lcn_bu_tweaks(struct b43_wldev *dev)
+ 	}
  }
  
++static void b43_phy_lcn_set_fixed_open_loop_gain(struct b43_wldev *dev);
++
++/* wlc_lcnphy_rfseq_tbl_adc_pwrup */
++static u16 b43_phy_lcn_rfseq_tbl_adc_pwrup(struct b43_wldev *dev)
++{
++	u16 n1, n2, n3, n4, n5, n6, n;
++
++	n1 = b43_phy_read(dev, 0x4a5) & 0xff;
++	n2 = 1 << ((b43_phy_read(dev, 0x4a5) & (0x7 << 12)) >> 12);
++	n3 = b43_phy_read(dev, 0x40d) & 0xff;
++	n4 = 1 << ((b43_phy_read(dev, 0x40d) & (0x7 << 8)) >> 8);
++	n5 = b43_phy_read(dev, 0x4a2) & 0xff;
++	n6 = 1 << ((b43_phy_read(dev, 0x4a2) & (0x7 << 8)) >> 8);
++	n = 2 * (n1 + n2 + n3 + n4 + 2 * (n5 + n6)) + 80;
++	if (n < 1600)
++		n = 1600;
++	return n;
++}
++
  /* wlc_lcnphy_vbat_temp_sense_setup */
--static void b43_phy_lcn_sense_setup(struct b43_wldev *dev,
-+static void __maybe_unused b43_phy_lcn_sense_setup(struct b43_wldev *dev,
+ static void b43_phy_lcn_sense_setup(struct b43_wldev *dev,
  				    enum lcn_sense_type sense_type)
- {
- 	u8 auxpga_vmidcourse, auxpga_vmidfine, auxpga_gain;
-@@ -543,26 +543,28 @@ static void b43_phy_lcn_tx_pwr_ctl_init(struct b43_wldev *dev)
+@@ -350,7 +369,12 @@ static void b43_phy_lcn_sense_setup(struct b43_wldev *dev,
+ 	tx_pwr_idx = dev->phy.lcn->tx_pwr_curr_idx;
  
+ 	/* Setup */
+-	/* TODO: wlc_lcnphy_set_tx_pwr_by_index(pi, 127); */
++	/*
++	 * The wl blob calls set_tx_pwr_by_index(pi, 127) here to put a known
++	 * (max) gain on the sensing dummy frame. b43 has no per-index tx-power
++	 * table in Phase 1, so use the fixed open-loop gain instead.
++	 */
++	b43_phy_lcn_set_fixed_open_loop_gain(dev);
+ 	b43_radio_set(dev, 0x007, 0x1);
+ 	b43_radio_set(dev, 0x0ff, 0x10);
+ 	b43_radio_set(dev, 0x11f, 0x4);
+@@ -380,8 +404,13 @@ static void b43_phy_lcn_sense_setup(struct b43_wldev *dev,
+ 	b43_phy_set(dev, 0x939, 0x4);
+ 	b43_phy_set(dev, 0x4a4, 0x1000);
+ 
+-	/* FIXME: don't hardcode */
+-	b43_lcntab_write(dev, B43_LCNTAB16(0x8, 0x6), 0x640);
++	/*
++	 * The wl blob writes wlc_lcnphy_rfseq_tbl_adc_pwrup() here: the ADC
++	 * power-up time computed from the AFE/Rx-gain regs, floored at 1600.
++	 * 0x640 was just that floor.
++	 */
++	b43_lcntab_write(dev, B43_LCNTAB16(0x8, 0x6),
++			 b43_phy_lcn_rfseq_tbl_adc_pwrup(dev));
+ 
+ 	switch (sense_type) {
+ 	case B43_SENSE_TEMP:
+@@ -420,7 +449,9 @@ static void b43_phy_lcn_sense_setup(struct b43_wldev *dev,
+ 				save_radio_regs[i][1]);
+ 	for (i = 0; i < 14; i++)
+ 		b43_phy_write(dev, save_phy_regs[i][0], save_phy_regs[i][1]);
+-	/* TODO: wlc_lcnphy_set_tx_pwr_by_index(tx_pwr_idx) */
++	/* Phase 1: re-apply the fixed open-loop gain (no saved index) */
++	(void)tx_pwr_idx;
++	b43_phy_lcn_set_fixed_open_loop_gain(dev);
+ 	b43_radio_write(dev, 0x4a4, save_radio_4a4);
+ 
+ 	b43_mac_enable(dev);
+@@ -535,34 +566,44 @@ static void b43_phy_lcn_set_tx_gain(struct b43_wldev *dev,
+ 	b43_phy_lcn_set_tx_gain_override(dev, true);
+ }
+ 
++/*
++ * Phase-1 fixed open-loop TX gain. Stands in for the wl blob's
++ * set_tx_pwr_by_index() wherever a known gain is needed (tx-power init, the
++ * sensing dummy frame, the RX-IQ cal tone) until the per-index tx-power table
++ * is built in Phase 2. b43_phy_lcn_set_tx_gain() enables the gain override.
++ */
++static void b43_phy_lcn_set_fixed_open_loop_gain(struct b43_wldev *dev)
++{
++	struct lcn_tx_gains gains;
++
++	if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ) {
++		gains.gm_gain = 4;
++		gains.pga_gain = 12;
++		gains.pad_gain = 12;
++		gains.dac_gain = 0;
++	} else {
++		gains.gm_gain = 7;
++		gains.pga_gain = 15;
++		gains.pad_gain = 14;
++		gains.dac_gain = 0;
++	}
++	b43_phy_lcn_set_tx_gain(dev, &gains);
++	b43_phy_lcn_set_bbmult(dev, 150);
++}
++
+ /* wlc_lcnphy_tx_pwr_ctrl_init */
+ static void b43_phy_lcn_tx_pwr_ctl_init(struct b43_wldev *dev)
+ {
+-	struct lcn_tx_gains tx_gains;
+-	u8 bbmult;
+-
  	b43_mac_suspend(dev);
  
 -	if (!dev->phy.lcn->hw_pwr_ctl_capable) {
@@ -58,29 +157,17 @@ index 3ef30be..cca39dd 100644
 -		b43_phy_lcn_set_tx_gain(dev, &tx_gains);
 -		b43_phy_lcn_set_bbmult(dev, bbmult);
 -		b43_phy_lcn_sense_setup(dev, B43_SENSE_TEMP);
-+	/*
-+	 * Phase 1 bring-up: run open-loop at a fixed TX gain. Hardware power
-+	 * control and temperature/vbat sensing depend on the unfinished
-+	 * tx-power-by-index path (see the TODOs in b43_phy_lcn_sense_setup)
-+	 * and on ucode-assisted calibration, so they are deferred. This is
-+	 * brcmsmac's !hw_pwr_ctl path with the sensing step removed.
-+	 */
-+	if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ) {
-+		tx_gains.gm_gain = 4;
-+		tx_gains.pga_gain = 12;
-+		tx_gains.pad_gain = 12;
-+		tx_gains.dac_gain = 0;
-+		bbmult = 150;
- 	} else {
+-	} else {
 -		b43err(dev->wl, "TX power control not supported for this HW\n");
-+		tx_gains.gm_gain = 7;
-+		tx_gains.pga_gain = 15;
-+		tx_gains.pad_gain = 14;
-+		tx_gains.dac_gain = 0;
-+		bbmult = 150;
- 	}
-+	b43_phy_lcn_set_tx_gain(dev, &tx_gains);
-+	b43_phy_lcn_set_bbmult(dev, bbmult);
+-	}
++	/*
++	 * Phase 1 bring-up: run open-loop at a fixed TX gain. Closed-loop (hw)
++	 * tx-power control is Phase 2, but keep the temperature/vbat sensing
++	 * mainline does here -- b43_phy_lcn_sense_setup() now computes the ADC
++	 * power-up time the wl way instead of hardcoding it.
++	 */
++	b43_phy_lcn_set_fixed_open_loop_gain(dev);
++	b43_phy_lcn_sense_setup(dev, B43_SENSE_TEMP);
  
  	b43_mac_enable(dev);
  }
