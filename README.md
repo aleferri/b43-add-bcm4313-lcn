@@ -81,6 +81,20 @@ testate su hardware**. Rebasare sul tuo tree di destinazione (la versione
 del kernel OpenWrt differisce — i nomi di struct/framework cambiano) prima
 di buildare.
 
+## Verifica contro il blob
+
+`wl.ko` (driver proprietario, MIPS32 BE, non strippato) e' la verita' di
+riferimento per questo silicio. `tools/verify_blob.py` disassembla le funzioni
+`wlc_lcnphy_*` e confronta le costanti delle patch con quelle reali:
+
+    python3 -m venv .venv && . .venv/bin/activate
+    pip install -r requirements.txt
+    python3 tools/verify_blob.py
+
+Stato e risultati in `docs/blob-verification.md`: 0002 confermata dal blob,
+0001 divergenza benigna (poll presente in brcmsmac, budget allineato a 10 s),
+0004 preflight rc_cal (landmark 0x933..0x937 confermato).
+
 ## Build / test
 
 1. Estrarre l'ucode proprietario: `b43-fwcutter` sul driver proprietario del BCM4313.

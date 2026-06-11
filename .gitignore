@@ -1,0 +1,32 @@
+# --- Python tooling (tools/) ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# --- estrazione ucode proprietario (b43-fwcutter) ---
+# l'ucode NON va committato: si rigenera dal driver proprietario al build
+*.fw
+ucode*_lcn.fw
+/fwcutter-out/
+
+# --- artefatti di build kernel/modulo ---
+*.o
+*.o.cmd
+*.ko.cmd
+*.mod
+*.mod.c
+.tmp_versions/
+Module.symvers
+modules.order
+
+# --- output locali della verifica ---
+/tools/report.txt
+
+# --- editor / OS ---
+*.swp
+*~
+.idea/
+.vscode/
+.DS_Store

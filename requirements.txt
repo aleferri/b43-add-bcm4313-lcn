@@ -1,0 +1,10 @@
+# Toolchain per la verifica delle patch contro il blob proprietario (wl.ko).
+# wl.ko e' un modulo MIPS32 big-endian rilocabile e NON strippato: si
+# disassembla e si confrontano le costanti con quelle transliterate nelle patch.
+#
+#   python3 -m venv .venv && . .venv/bin/activate
+#   pip install -r requirements.txt
+#   python3 tools/verify_blob.py
+
+pyelftools>=0.30   # parsing ELF: simboli, sezioni, rilocazioni
+capstone>=5.0      # disassembler MIPS32 (CS_MODE_MIPS32 | CS_MODE_BIG_ENDIAN)

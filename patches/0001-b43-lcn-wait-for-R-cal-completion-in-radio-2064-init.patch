@@ -12,7 +12,8 @@ proceeds before the resistor calibration has settled.
 In brcmsmac, wlc_lcnphy_rcal() does mdelay(5) then
 SPINWAIT(!wlc_radio_2064_rcal_done(pi)), where
 wlc_radio_2064_rcal_done(pi) == (read_radio_reg(pi, 0x05c) & 0x20).
-Mirror that here with a bounded poll (b43 has no SPINWAIT).
+Mirror that here with a bounded poll (b43 has no SPINWAIT), keeping the
+same 10 s timeout budget (1000000 * udelay(10)).
 
 NOT validated on hardware; transliteration against brcmsmac phy_lcn.c.
 Part of the LCN-PHY (BCM4313) bring-up for the A4100N.
@@ -43,7 +44,7 @@ index dd72689..3ef30be 100644
 -	b43_radio_read(dev, 0x05c);
 +	mdelay(5);
 +	/* R-cal done: RADIO 0x05c bit5 (wlc_radio_2064_rcal_done) */
-+	for (i = 0; i < 10000; i++) {		/* up to ~100 ms */
++	for (i = 0; i < 1000000; i++) {		/* up to ~10 s, as brcmsmac SPINWAIT */
 +		if (b43_radio_read(dev, 0x05c) & 0x20)
 +			break;
 +		udelay(10);
